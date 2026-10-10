@@ -19,16 +19,16 @@ SENDER_EMAIL = os.getenv("SENDER_EMAIL", "onboarding@resend.dev")
 
 
 @app.post("/api/audit")
-async def run_audit(email: str = Form(...), file: UploadFile = File(...)):
+async def run_audit(email: str = Form(...), file: UploadFile = Form(...)):
   file_bytes = await file.read()
 
   # Запрос к Gemini через OpenRouter
-  headers = {
+  ai_headers = {
       "Authorization": f"Bearer {OPENROUTER_API_KEY}",
       "Content-Type": "application/json",
   }
 
-  payload = {
+  ai_payload = {
       "model": "google/gemini-1.5-pro",
       "messages": [
           {
@@ -44,8 +44,8 @@ async def run_audit(email: str = Form(...), file: UploadFile = File(...)):
 
   ai_response = requests.post(
       "https://openrouter.ai/api/v1/chat/completions",
-      json=payload,
-      headers=headers,
+      json=ai_payload,
+      headers=ai_headers,
   )
   ai_data = ai_response.json()
   report_text = (
@@ -63,13 +63,18 @@ async def run_audit(email: str = Form(...), file: UploadFile = File(...)):
   resend_payload = {
       "from": SENDER_EMAIL,
       "to": [email],
-      нд = {
-          "from": SENDER_EMAIL,
-          "to": [email],
-          "subject": "Ваш экспресс-аудит ИЖС готов 🏗️",
-          "html": (
-              f"<h2>Результаты экспресс-аудита</h2><div"
-              f" style='white-space: pre-wrap;'>{report_text}</div>"
-          ),
-      },
+      "subject": "Ваш экспресс-аудит ИЖС готов 🏗️",
+      "html": (
+          f"<h2>Результаты экспресс-аудита</h2><div"
+          f" style='white-space: pre-wrap;'>{report_text}</div>"
+      ),
+  }
+
+  resend_response = requests.post(
+      "https://api.resend.com/emails", json=resend_payload, headers=resend_headers
+  )
+
+  return {
+      "status": "success",
+      "email_sent": resend_response.status_code == 200,
   }
