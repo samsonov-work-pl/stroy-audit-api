@@ -35,7 +35,7 @@ async def run_audit(email: str = Form(...), file: UploadFile = File(...)):
   }
 
   ai_payload = {
-      "model": "google/gemini-1.5-pro",
+      "model": "google/gemini-2.5-pro",
       "messages": [{
           "role": "user",
           "content": [
