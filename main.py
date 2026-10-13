@@ -16,7 +16,7 @@ app.add_middleware(
 )
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-GOOGLE_SHEET_URL = "ЗДЕСЬ_ВАША_ССЫЛКА_ОТ_GOOGLE"  # Ваша ссылка на гугл-таблицу
+GOOGLE_SHEET_URL = "https://script.google.com/macros/s/AKfycbzBeIqxEy3j38ZjsEvg31NRdPW36qZ4trttabPISAo-uVYDdAZvAcEZrr8eypMycmEiwQ/exec"  # Ваша ссылка на гугл-таблицу
 
 @app.post("/api/audit")
 async def run_audit(
