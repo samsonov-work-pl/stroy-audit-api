@@ -1,6 +1,7 @@
 import base64
 import os
 import requests
+from datetime import datetime
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -15,7 +16,8 @@ app.add_middleware(
 )
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-
+# Вставьте сюда ваш полученный URL от Google Apps Script:
+GOOGLE_SHEET_URL = "https://script.google.com/macros/s/AKfycbzBeIqxEy3j38ZjsEvg31NRdPW36qZ4trttabPISAo-uVYDdAZvAcEZrr8eypMycmEiwQ/exec"
 
 @app.post("/api/audit")
 async def run_audit(
@@ -24,10 +26,23 @@ async def run_audit(
     consent_accepted: bool = Form(...),
     consent_version: str = Form(default="2026-10-12")
 ):
-    # Проверка согласия с дисклеймером
+    # 1. Проверка согласия с дисклеймером
     if not consent_accepted:
         raise HTTPException(status_code=400, detail="Необходимо согласие с условиями дисклеймера.")
 
+    # 2. Отправка данных о согласии и клиенте в Google Таблицу
+    if GOOGLE_SHEET_URL and "macros/s" in GOOGLE_SHEET_URL:
+        try:
+            sheet_payload = {
+                "email": email,
+                "consent_accepted": consent_accepted,
+                "consent_version": consent_version
+            }
+            requests.post(GOOGLE_SHEET_URL, json=sheet_payload, timeout=5)
+        except Exception as sheet_error:
+            print(f"Ошибка отправки в Google Таблицу: {sheet_error}")
+
+    # 3. Чтение файла и отправка в OpenRouter (ваш основной код)
     file_bytes = await file.read()
     file_base64 = base64.b64encode(file_bytes).decode("utf-8")
     
@@ -73,5 +88,4 @@ async def run_audit(
     except Exception as e:
         report_text = f"Ошибка запроса к ИИ: {str(e)}"
 
-    # Возвращаем готовый отчет прямо на сайт!
     return {"status": "success", "report": report_text}
