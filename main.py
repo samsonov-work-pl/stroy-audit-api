@@ -1,7 +1,7 @@
 import base64
 import os
 import requests
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
@@ -18,10 +18,17 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
 
 @app.post("/api/audit")
-async def run_audit(email: str = Form(...), file: UploadFile = File(...)):
-  file_bytes = await file.read()
+async def run_audit(
+    email: str = Form(...), 
+    file: UploadFile = File(...),
+    consent_accepted: bool = Form(...),
+    consent_version: str = Form(default="2026-10-12")
+):
+    # Проверка согласия с дисклеймером
+    if not consent_accepted:
+        raise HTTPException(status_code=400, detail="Необходимо согласие с условиями дисклеймера.")
 
-  file_base64 = base64.b64encode(file_bytes).decode("utf-8")
+    file_bytes = await file.read()   file_base64 = base64.b64encode(file_bytes).decode("utf-8")
   mime_type = file.content_type or "application/pdf"
   file_data_url = f"data:{mime_type};base64,{file_base64}"
 
