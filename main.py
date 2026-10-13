@@ -34,44 +34,44 @@ async def run_audit(
     mime_type = file.content_type or "application/pdf"
     file_data_url = f"data:{mime_type};base64,{file_base64}"
 
-  ai_headers = {
-      "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-      "Content-Type": "application/json",
-  }
+    ai_headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+    }
 
-  ai_payload = {
-      "model": "google/gemini-2.5-pro",
-      "messages": [{
-          "role": "user",
-          "content": [
-              {
-                  "type": "text",
-                  "text": (
-                      "Проведи строительный экспресс-аудит проекта по нормам"
-                      " Беларуси (СН и СП РБ). Найди базовые ошибки (мокрые зоны,"
-                      " котельные, инсоляция)."
-                  ),
-              },
-              {"type": "image_url", "image_url": {"url": file_data_url}},
-          ],
-      }],
-  }
+    ai_payload = {
+        "model": "google/gemini-2.5-pro",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        "Проведи строительный экспресс-аудит проекта по нормам"
+                        " Беларуси (СН и СП РБ). Найди базовые ошибки (мокрые зоны,"
+                        " котельные, инсоляция)."
+                    ),
+                },
+                {"type": "image_url", "image_url": {"url": file_data_url}},
+            ],
+        }],
+    }
 
-  try:
-    ai_response = requests.post(
-        "https://openrouter.ai/api/v1/chat/completions",
-        json=ai_payload,
-        headers=ai_headers,
-        timeout=60,
-    )
-    ai_data = ai_response.json()
+    try:
+        ai_response = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            json=ai_payload,
+            headers=ai_headers,
+            timeout=60,
+        )
+        ai_data = ai_response.json()
 
-    if "choices" in ai_data and len(ai_data["choices"]) > 0:
-      report_text = ai_data["choices"][0]["message"]["content"]
-    else:
-      report_text = f"Ошибка от OpenRouter: {str(ai_data)}"
-  except Exception as e:
-    report_text = f"Ошибка запроса к ИИ: {str(e)}"
+        if "choices" in ai_data and len(ai_data["choices"]) > 0:
+            report_text = ai_data["choices"][0]["message"]["content"]
+        else:
+            report_text = f"Ошибка от OpenRouter: {str(ai_data)}"
+    except Exception as e:
+        report_text = f"Ошибка запроса к ИИ: {str(e)}"
 
-  # Возвращаем готовый отчет прямо на сайт!
-  return {"status": "success", "report": report_text}
+    # Возвращаем готовый отчет прямо на сайт!
+    return {"status": "success", "report": report_text}
