@@ -28,9 +28,10 @@ async def run_audit(
     if not consent_accepted:
         raise HTTPException(status_code=400, detail="Необходимо согласие с условиями дисклеймера.")
 
-    file_bytes = await file.read()   file_base64 = base64.b64encode(file_bytes).decode("utf-8")
-  mime_type = file.content_type or "application/pdf"
-  file_data_url = f"data:{mime_type};base64,{file_base64}"
+    file_bytes = await file.read()   
+    file_base64 = base64.b64encode(file_bytes).decode("utf-8")
+    mime_type = file.content_type or "application/pdf"
+    file_data_url = f"data:{mime_type};base64,{file_base64}"
 
   ai_headers = {
       "Authorization": f"Bearer {OPENROUTER_API_KEY}",
