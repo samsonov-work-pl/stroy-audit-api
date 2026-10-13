@@ -16,34 +16,41 @@ app.add_middleware(
 )
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-# Вставьте сюда ваш полученный URL от Google Apps Script:
-GOOGLE_SHEET_URL = "https://script.google.com/macros/s/AKfycbzBeIqxEy3j38ZjsEvg31NRdPW36qZ4trttabPISAo-uVYDdAZvAcEZrr8eypMycmEiwQ/exec"
+GOOGLE_SHEET_URL = "ЗДЕСЬ_ВАША_ССЫЛКА_ОТ_GOOGLE"  # Ваша ссылка на гугл-таблицу
 
 @app.post("/api/audit")
 async def run_audit(
     email: str = Form(...), 
     file: UploadFile = File(...),
-    consent_accepted: bool = Form(...),
+    # Принимаем consent_accepted как строку или булево, чтобы избежать ошибок парсинга:
+    consent_accepted: str = Form(...),
     consent_version: str = Form(default="2026-10-12")
 ):
+    # Превращаем пришедшее значение (строку или булево) в надежный Python boolean (True/False)
+    if isinstance(consent_accepted, str):
+        is_accepted = consent_accepted.lower() in ("true", "1", "yes", "on")
+    else:
+        is_accepted = bool(consent_accepted)
+
     # 1. Проверка согласия с дисклеймером
-    if not consent_accepted:
+    if not is_accepted:
         raise HTTPException(status_code=400, detail="Необходимо согласие с условиями дисклеймера.")
 
-    # 2. Отправка данных о согласии и клиенте в Google Таблицу
+    # 2. Отправка данных о согласии в Google Таблицу
     if GOOGLE_SHEET_URL and "macros/s" in GOOGLE_SHEET_URL:
         try:
             sheet_payload = {
                 "email": email,
-                "consent_accepted": consent_accepted,
+                "consent_accepted": is_accepted,
                 "consent_version": consent_version
             }
             requests.post(GOOGLE_SHEET_URL, json=sheet_payload, timeout=5)
         except Exception as sheet_error:
             print(f"Ошибка отправки в Google Таблицу: {sheet_error}")
 
-    # 3. Чтение файла и отправка в OpenRouter (ваш основной код)
+    # 3. Чтение файла и отправка в OpenRouter
     file_bytes = await file.read()
+    file_base64 = base64.b64encode(file_bytes).decode("text/plain" if hasattr(base64, 'plain') else "utf-8") # стандартный кодек
     file_base64 = base64.b64encode(file_bytes).decode("utf-8")
     
     mime_type = file.content_type or "application/pdf"
