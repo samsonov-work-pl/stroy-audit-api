@@ -2,6 +2,7 @@ import base64
 import os
 import requests
 from datetime import datetime
+from functools import lru_cache
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -16,23 +17,49 @@ app.add_middleware(
 )
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-GOOGLE_SHEET_URL = "https://script.google.com/macros/s/AKfycbzBeIqxEy3j38ZjsEvg31NRdPW36qZ4trttabPISAo-uVYDdAZvAcEZrr8eypMycmEiwQ/exec"  # Ваша ссылка на гугл-таблицу
+GOOGLE_SHEET_URL = "https://script.google.com/macros/s/AKfycbzBeIqxEy3j38ZjsEvg31NRdPW36qZ4trttabPISAo-uVYDdAZvAcEZrr8eypMycmEiwQ/exec"
+
+# Функция динамической загрузки промта из твоего репозитория GitHub с кэшированием
+@lru_cache(maxsize=16)
+def load_prompt_from_github(jurisdiction: str) -> str:
+    # Очищаем название юрисдикции на всякий случай
+    clean_jurisdiction = jurisdiction.strip().lower()
+    
+    # Допустимые варианты файлов в репозитории
+    allowed_files = ["belarus", "russia", "kazakhstan", "eurocodes"]
+    if clean_jurisdiction not in allowed_files:
+        clean_jurisdiction = "belarus"  # Fallback по умолчанию
+        
+    github_url = f"https://raw.githubusercontent.com/samsonov-work-pl/stroy-audit-api/main/{clean_jurisdiction}.md"
+    
+    try:
+        response = requests.get(github_url, timeout=5)
+        if response.status_code == 200:
+            return response.text
+    except Exception as e:
+        print(f"Ошибка загрузки промта с GitHub для {clean_jurisdiction}: {e}")
+        
+    # Жесткий Fallback, если GitHub недоступен
+    return (
+        "Проведи строительный экспресс-аудит проекта по нормам РФ (СП и СНиП). "
+        "Найди базовые ошибки (мокрые зоны, котельные, инсоляция)."
+    )
 
 @app.post("/api/audit")
 async def run_audit(
     email: str = Form(...), 
     file: UploadFile = File(...),
-    # Принимаем consent_accepted как строку или булево, чтобы избежать ошибок парсинга:
     consent_accepted: str = Form(...),
-    consent_version: str = Form(default="2026-10-12")
+    consent_version: str = Form(default="2026-10-12"),
+    # Принимаем юрисдикцию от фронтенда (по умолчанию Российская федирация)
+    jurisdiction: str = Form(default="russia")
 ):
-    # Превращаем пришедшее значение (строку или булево) в надежный Python boolean (True/False)
+    # 1. Превращаем пришедшее значение согласия в надежный Python boolean
     if isinstance(consent_accepted, str):
         is_accepted = consent_accepted.lower() in ("true", "1", "yes", "on")
     else:
         is_accepted = bool(consent_accepted)
 
-    # 1. Проверка согласия с дисклеймером
     if not is_accepted:
         raise HTTPException(status_code=400, detail="Необходимо согласие с условиями дисклеймера.")
 
@@ -42,15 +69,19 @@ async def run_audit(
             sheet_payload = {
                 "email": email,
                 "consent_accepted": is_accepted,
-                "consent_version": consent_version
+                "consent_version": consent_version,
+                "jurisdiction": jurisdiction,
+                "timestamp": datetime.utcnow().isoformat()
             }
             requests.post(GOOGLE_SHEET_URL, json=sheet_payload, timeout=5)
         except Exception as sheet_error:
             print(f"Ошибка отправки в Google Таблицу: {sheet_error}")
 
-    # 3. Чтение файла и отправка в OpenRouter
+    # 3. Загружаем нужный промт с GitHub на основе выбранной юрисдикции
+    active_prompt = load_prompt_from_github(jurisdiction)
+
+    # 4. Чтение файла и отправка в OpenRouter
     file_bytes = await file.read()
-    file_base64 = base64.b64encode(file_bytes).decode("text/plain" if hasattr(base64, 'plain') else "utf-8") # стандартный кодек
     file_base64 = base64.b64encode(file_bytes).decode("utf-8")
     
     mime_type = file.content_type or "application/pdf"
@@ -68,11 +99,7 @@ async def run_audit(
             "content": [
                 {
                     "type": "text",
-                    "text": (
-                        "Проведи строительный экспресс-аудит проекта по нормам"
-                        " Беларуси (СН и СП РБ). Найди базовые ошибки (мокрые зоны,"
-                        " котельные, инсоляция)."
-                    ),
+                    "text": active_prompt,  # Подставляем динамический промт с GitHub
                 },
                 {"type": "image_url", "image_url": {"url": file_data_url}},
             ],
@@ -95,4 +122,4 @@ async def run_audit(
     except Exception as e:
         report_text = f"Ошибка запроса к ИИ: {str(e)}"
 
-    return {"status": "success", "report": report_text}
+    return {"status": "success", "jurisdiction": jurisdiction, "report": report_text}
