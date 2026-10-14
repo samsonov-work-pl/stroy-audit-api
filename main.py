@@ -5,6 +5,7 @@ from datetime import datetime
 from functools import lru_cache
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 app = FastAPI()
 
@@ -36,13 +37,12 @@ def load_prompt_from_github(jurisdiction: str, audit_type: str = "express") -> s
         response = requests.get(github_url, timeout=5)
         if response.status_code == 200:
             base_prompt = response.text
-            # Если это экспресс-аудит, модифицируем промт для режима "затравки"
             if audit_type == "express":
                 return (
                     f"{base_prompt}\n\n"
                     "⚠️ РЕЖИМ ЭКСПРЕСС-АНАЛИЗА (Лид-магнит):\n"
-                    "Выдай только краткое резюме и ТОП-3 самых критических риска/ошибки в проекте. "
-                    "В конце добавь блок с предложением разблокировать полный глубокий аудит и PDF-отчет."
+                    "Выдай строго топ-3 самых критических риска/ошибки в проекте (в формате коротких буллетов с красным кругом 🔴) "
+                    "и общее краткое резюме. Не выдавай полную таблицу — оставь её для глубокого аудита."
                 )
             return base_prompt
     except Exception as e:
@@ -50,7 +50,7 @@ def load_prompt_from_github(jurisdiction: str, audit_type: str = "express") -> s
         
     return "Проведи строительный экспресс-аудит проекта."
 
-# 1. ЭНДПОИНТ БЕСПЛАТНОГО ЭКСПРЕСС-АУДИТА (Flash)
+# 1. ЭНДПОИНТ ЭКСПРЕСС-АУДИТА (Flash)
 @app.post("/api/audit/express")
 async def run_express_audit(
     email: str = Form(...), 
@@ -69,7 +69,7 @@ async def run_express_audit(
     file_data_url = f"data:{mime_type};base64,{file_base64}"
 
     ai_payload = {
-        "model": "google/gemini-2.5-flash", # Быстрая модель для лид-магнита
+        "model": "google/gemini-2.5-flash",
         "messages": [{
             "role": "user",
             "content": [
@@ -94,18 +94,14 @@ async def run_express_audit(
     return {"status": "success", "tier": "express", "jurisdiction": jurisdiction, "report": report_text}
 
 
-# 2. ЭНДПОИНТ ПЛАТНОГО ГЛУБОКОГО АУДИТА (Pro + PDF ready)
+# 2. ЭНДПОИНТ ГЛУБОКОГО АУДИТА (Pro + PDF ссылка)
 @app.post("/api/audit/deep")
 async def run_deep_audit(
     email: str = Form(...), 
     file: UploadFile = File(...),
     jurisdiction: str = Form(default="russia"),
-    payment_verified: str = Form(default="false") # Проверка оплаты
+    payment_verified: str = Form(default="true") # С фронтенда приходит после имитации оплаты
 ):
-    # Здесь в будущем будет интеграция с платежным шлюзом (Stripe / ЮKassa / Белкард)
-    if not str(payment_verified).lower() in ("true", "1", "yes", "on"):
-        raise HTTPException(status_code=403, detail="Требуется оплата для доступа к глубокому аудиту и PDF-отчету.")
-
     active_prompt = load_prompt_from_github(jurisdiction, audit_type="deep")
 
     file_bytes = await file.read()
@@ -114,7 +110,7 @@ async def run_deep_audit(
     file_data_url = f"data:{mime_type};base64,{file_base64}"
 
     ai_payload = {
-        "model": "google/gemini-2.5-pro", # Тяжелая модель для глубокого экспертного анализа
+        "model": "google/gemini-2.5-pro",
         "messages": [{
             "role": "user",
             "content": [
@@ -136,10 +132,11 @@ async def run_deep_audit(
     except Exception as e:
         report_text = f"Ошибка глубокого анализа: {e}"
 
+    # Возвращаем полный отчет и ссылку на PDF (для MVP можно возвращать data-url или заглушку генерации)
     return {
         "status": "success", 
         "tier": "deep", 
         "jurisdiction": jurisdiction, 
         "report": report_text,
-        "pdf_download_url": "#" # Ссылка на скачивание сгенерированного PDF
+        "pdf_url": "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf" # Ссылка для скачивания (в будущем — сгенерированный PDF)
     }
