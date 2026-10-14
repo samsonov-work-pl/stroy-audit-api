@@ -28,7 +28,7 @@ def load_prompt_from_github(jurisdiction: str) -> str:
     # Допустимые варианты файлов в репозитории
     allowed_files = ["belarus", "russia", "kazakhstan", "eurocodes"]
     if clean_jurisdiction not in allowed_files:
-        clean_jurisdiction = "belarus"  # Fallback по умолчанию
+        clean_jurisdiction = "russia"  # Fallback по умолчанию
         
     github_url = f"https://raw.githubusercontent.com/samsonov-work-pl/stroy-audit-api/main/{clean_jurisdiction}.md"
     
@@ -51,7 +51,7 @@ async def run_audit(
     file: UploadFile = File(...),
     consent_accepted: str = Form(...),
     consent_version: str = Form(default="2026-10-12"),
-    # Принимаем юрисдикцию от фронтенда (по умолчанию Российская федирация)
+    # Принимаем юрисдикцию от фронтенда (по умолчанию Российская федерация)
     jurisdiction: str = Form(default="russia")
 ):
     # 1. Превращаем пришедшее значение согласия в надежный Python boolean
@@ -63,7 +63,7 @@ async def run_audit(
     if not is_accepted:
         raise HTTPException(status_code=400, detail="Необходимо согласие с условиями дисклеймера.")
 
-    # 2. Отправка данных о согласии в Google Таблицу
+    # 2. Отправка данных о согласии в Google Таблицу (с защитой от долгого ответа)
     if GOOGLE_SHEET_URL and "macros/s" in GOOGLE_SHEET_URL:
         try:
             sheet_payload = {
@@ -73,9 +73,9 @@ async def run_audit(
                 "jurisdiction": jurisdiction,
                 "timestamp": datetime.utcnow().isoformat()
             }
-            requests.post(GOOGLE_SHEET_URL, json=sheet_payload, timeout=5)
+            requests.post(GOOGLE_SHEET_URL, json=sheet_payload, timeout=3)
         except Exception as sheet_error:
-            print(f"Ошибка отправки в Google Таблицу: {sheet_error}")
+            print(f"Ошибка отправки в Google Таблицу (не критично): {sheet_error}")
 
     # 3. Загружаем нужный промт с GitHub на основе выбранной юрисдикции
     active_prompt = load_prompt_from_github(jurisdiction)
@@ -107,19 +107,28 @@ async def run_audit(
     }
 
     try:
+        print(f"Отправка запроса в OpenRouter (юрисдикция: {jurisdiction})...")
         ai_response = requests.post(
             "https://openrouter.ai/api/v1/chat/completions",
             json=ai_payload,
             headers=ai_headers,
-            timeout=60,
+            timeout=90,
         )
+        
+        print(f"OpenRouter Status Code: {ai_response.status_code}")
         ai_data = ai_response.json()
+        print(f"OpenRouter Response JSON: {ai_data}")
 
         if "choices" in ai_data and len(ai_data["choices"]) > 0:
-            report_text = ai_data["choices"][0]["message"]["content"]
+            report_text = ai_data["choices"][0]["message"].get("content")
+        elif "error" in ai_data:
+            err_msg = ai_data['error'].get('message', str(ai_data['error']))
+            report_text = f"Ошибка OpenRouter API: {err_msg}"
         else:
-            report_text = f"Ошибка от OpenRouter: {str(ai_data)}"
+            report_text = f"Неизвестный ответ от ИИ: {str(ai_data)}"
+            
     except Exception as e:
+        print(f"Критическая ошибка запроса к OpenRouter: {str(e)}")
         report_text = f"Ошибка запроса к ИИ: {str(e)}"
 
     return {"status": "success", "jurisdiction": jurisdiction, "report": report_text}
