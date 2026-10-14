@@ -16,6 +16,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Health-check эндпоинт для мгновенного прохождения проверки Render
+@app.get("/")
+def health_check():
+    return {"status": "online", "service": "stroy-audit-api"}
+
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 GOOGLE_SHEET_URL = "https://script.google.com/macros/s/AKfycbzBeIqxEy3j38ZjsEvg31NRdPW36qZ4trttabPISAo-uVYDdAZvAcEZrr8eypMycmEiwQ/exec"
 
