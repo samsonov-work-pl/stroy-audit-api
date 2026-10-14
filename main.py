@@ -24,13 +24,11 @@ def health_check():
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 GOOGLE_SHEET_URL = "https://script.google.com/macros/s/AKfycbzBeIqxEy3j38ZjsEvg31NRdPW36qZ4trttabPISAo-uVYDdAZvAcEZrr8eypMycmEiwQ/exec"
 
-# Функция динамической загрузки промта из твоего репозитория GitHub с кэшированием
+# Функция динамической загрузки промта из репозитория GitHub с кэшированием
 @lru_cache(maxsize=16)
 def load_prompt_from_github(jurisdiction: str) -> str:
-    # Очищаем название юрисдикции на всякий случай
     clean_jurisdiction = jurisdiction.strip().lower()
     
-    # Допустимые варианты файлов в репозитории
     allowed_files = ["belarus", "russia", "kazakhstan", "eurocodes"]
     if clean_jurisdiction not in allowed_files:
         clean_jurisdiction = "russia"  # Fallback по умолчанию
@@ -44,7 +42,6 @@ def load_prompt_from_github(jurisdiction: str) -> str:
     except Exception as e:
         print(f"Ошибка загрузки промта с GitHub для {clean_jurisdiction}: {e}")
         
-    # Жесткий Fallback, если GitHub недоступен
     return (
         "Проведи строительный экспресс-аудит проекта по нормам РФ (СП и СНиП). "
         "Найди базовые ошибки (мокрые зоны, котельные, инсоляция)."
@@ -56,10 +53,9 @@ async def run_audit(
     file: UploadFile = File(...),
     consent_accepted: str = Form(...),
     consent_version: str = Form(default="2026-10-12"),
-    # Принимаем юрисдикцию от фронтенда (по умолчанию Российская федерация)
     jurisdiction: str = Form(default="russia")
 ):
-    # 1. Превращаем пришедшее значение согласия в надежный Python boolean
+    # 1. Проверка согласия
     if isinstance(consent_accepted, str):
         is_accepted = consent_accepted.lower() in ("true", "1", "yes", "on")
     else:
@@ -68,7 +64,7 @@ async def run_audit(
     if not is_accepted:
         raise HTTPException(status_code=400, detail="Необходимо согласие с условиями дисклеймера.")
 
-    # 2. Отправка данных о согласии в Google Таблицу (с защитой от долгого ответа)
+    # 2. Отправка данных о согласии в Google Таблицу (некритично)
     if GOOGLE_SHEET_URL and "macros/s" in GOOGLE_SHEET_URL:
         try:
             sheet_payload = {
@@ -80,9 +76,9 @@ async def run_audit(
             }
             requests.post(GOOGLE_SHEET_URL, json=sheet_payload, timeout=3)
         except Exception as sheet_error:
-            print(f"Ошибка отправки в Google Таблицу (не критично): {sheet_error}")
+            print(f"Ошибка отправки в Google Таблицу: {sheet_error}")
 
-    # 3. Загружаем нужный промт с GitHub на основе выбранной юрисдикции
+    # 3. Загружаем промт с GitHub
     active_prompt = load_prompt_from_github(jurisdiction)
 
     # 4. Чтение файла и отправка в OpenRouter
@@ -104,7 +100,7 @@ async def run_audit(
             "content": [
                 {
                     "type": "text",
-                    "text": active_prompt,  # Подставляем динамический промт с GitHub
+                    "text": active_prompt,
                 },
                 {"type": "image_url", "image_url": {"url": file_data_url}},
             ],
@@ -117,7 +113,7 @@ async def run_audit(
             "https://openrouter.ai/api/v1/chat/completions",
             json=ai_payload,
             headers=ai_headers,
-            timeout=90,
+            timeout=120,  # Увеличенный таймаут для больших PDF
         )
         
         print(f"OpenRouter Status Code: {ai_response.status_code}")
@@ -125,7 +121,15 @@ async def run_audit(
         print(f"OpenRouter Response JSON: {ai_data}")
 
         if "choices" in ai_data and len(ai_data["choices"]) > 0:
-            report_text = ai_data["choices"][0]["message"].get("content")
+            message_obj = ai_data["choices"][0]["message"]
+            report_text = message_obj.get("content")
+            
+            # Защита от пустого ответа / тайм-аута рассуждений модели
+            if not report_text:
+                report_text = (
+                    "⚠️ Превышено время ожидания ответа модели (тайм-аут генерации или скрытые рассуждения). "
+                    "Попробуйте отправить файл меньшего размера или повторить запрос через минуту."
+                )
         elif "error" in ai_data:
             err_msg = ai_data['error'].get('message', str(ai_data['error']))
             report_text = f"Ошибка OpenRouter API: {err_msg}"
