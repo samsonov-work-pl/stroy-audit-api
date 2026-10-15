@@ -37,14 +37,20 @@ def load_prompt_from_github(jurisdiction: str, audit_type: str = "express") -> s
         response = requests.get(github_url, timeout=5)
         if response.status_code == 200:
             base_prompt = response.text
+            
+            # Если это экспресс-аудит, дополняем Pro-шаблон инструкцией для лид-магнита
             if audit_type == "express":
-                return (
-                    f"{base_prompt}\n\n"
-                    "⚠️ РЕЖИМ ЭКСПРЕСС-АНАЛИЗА (Лид-магнит):\n"
-                    "Выдай строго топ-3 самых критических риска/ошибки в проекте (в формате коротких буллетов с красным кругом 🔴) "
-                    "и общее краткое резюме. Не выдавай полную таблицу — оставь её для глубокого аудита."
+                express_modifier = (
+                    "\n\n--- ИНСТРУКЦИЯ ДЛЯ ЭКСПРЕСС-РЕЖИМА (ЛИД-МАГНИТ) ---\n"
+                    "Выдай подробный предварительный аудит:\n"
+                    "1. Заполни разделы: краткое резюме, достоинства проекта и основные замечания.\n"
+                    "2. Таблицу рисков заполни только для топ-3 главных нарушений, остальные строки скрой.\n"
+                    "3. В конце добавь блок-напоминание о том, что полный глубокий анализ, расширенная таблица и официальный PDF-отчет доступны после разблокировки Pro-версии.\n"
                 )
+                return base_prompt + express_modifier
+                
             return base_prompt
+            
     except Exception as e:
         print(f"Ошибка загрузки промта с GitHub: {e}")
         
@@ -100,7 +106,7 @@ async def run_deep_audit(
     email: str = Form(...), 
     file: UploadFile = File(...),
     jurisdiction: str = Form(default="russia"),
-    payment_verified: str = Form(default="true") # С фронтенда приходит после имитации оплаты
+    payment_verified: str = Form(default="true")
 ):
     active_prompt = load_prompt_from_github(jurisdiction, audit_type="deep")
 
@@ -132,11 +138,10 @@ async def run_deep_audit(
     except Exception as e:
         report_text = f"Ошибка глубокого анализа: {e}"
 
-    # Возвращаем полный отчет и ссылку на PDF (для MVP можно возвращать data-url или заглушку генерации)
     return {
         "status": "success", 
         "tier": "deep", 
         "jurisdiction": jurisdiction, 
         "report": report_text,
-        "pdf_url": "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf" # Ссылка для скачивания (в будущем — сгенерированный PDF)
+        "pdf_url": "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf"
     }
