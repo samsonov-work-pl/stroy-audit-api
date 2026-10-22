@@ -7,6 +7,8 @@ from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from payments import router as payments_router
+
 app = FastAPI()
 
 app.add_middleware(
@@ -16,6 +18,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(payments_router)
 
 @app.get("/")
 def health_check():
