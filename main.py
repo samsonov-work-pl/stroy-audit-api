@@ -143,7 +143,7 @@ async def run_express_audit(
             "https://openrouter.ai/api/v1/chat/completions",
             json=ai_payload,
             headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
-            timeout=45,
+            timeout=180,
         )
         ai_data = response.json()
         report_text = ai_data["choices"][0]["message"].get("content") if "choices" in ai_data else "Ошибка анализа."
