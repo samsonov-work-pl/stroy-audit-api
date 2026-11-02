@@ -28,13 +28,20 @@ REVOKE_EVENTS = {
     "chargeback.initiated",
     "subscription.cancelled",
 }
-PAID_PLANS = ("full", "developers")
-# Публичный продукт «Полный аудит». Учитывается даже без LAVA_PRODUCT_FULL.
-KNOWN_FULL_PRODUCTS = {"46156488-439c-4f84-86b9-7628f5a6e93e"}
+PAID_PLANS = ("full", "choice", "business", "developers")
+PLAN_SLOTS = {"full": 1, "choice": 3, "business": 10}
+KNOWN_FULL_PRODUCTS = {"e262a88a-aabe-4a5b-8cf8-d0774e25f98a"}
+KNOWN_FULL_OFFERS = {"897a9501-3853-49cd-b22c-1cada7b220ba"}
+KNOWN_CHOICE_PRODUCTS = {"46156488-439c-4f84-86b9-7628f5a6e93e"}
+KNOWN_CHOICE_OFFERS = {"5cf765a3-e5b3-4d79-8f4c-2f603aebf703"}
+KNOWN_BUSINESS_PRODUCTS = {"0ecbb153-f2a5-415b-93e0-03fd0a2b04c6"}
+KNOWN_BUSINESS_OFFERS = {"98783786-61c8-4f37-aa28-ffc1a4477c94"}
 
 PLAN_LABELS = {
     "express": "Экспресс",
     "full": "Полный аудит",
+    "choice": "Выбор застройщика",
+    "business": "Профи / Бизнес",
     "developers": "Для застройщиков",
 }
 
@@ -153,7 +160,9 @@ def resolve_plan(payload: dict[str, Any], data: dict[str, Any]) -> str | None:
     ).lower()
 
     mapping = (
-        ("full", csv_ids("LAVA_OFFER_FULL") | csv_ids("LAVA_PRODUCT_FULL") | KNOWN_FULL_PRODUCTS),
+        ("full", csv_ids("LAVA_OFFER_FULL") | csv_ids("LAVA_PRODUCT_FULL") | KNOWN_FULL_PRODUCTS | KNOWN_FULL_OFFERS),
+        ("choice", csv_ids("LAVA_OFFER_CHOICE") | csv_ids("LAVA_PRODUCT_CHOICE") | KNOWN_CHOICE_PRODUCTS | KNOWN_CHOICE_OFFERS),
+        ("business", csv_ids("LAVA_OFFER_BUSINESS") | csv_ids("LAVA_PRODUCT_BUSINESS") | KNOWN_BUSINESS_PRODUCTS | KNOWN_BUSINESS_OFFERS),
         ("developers", csv_ids("LAVA_OFFER_DEVELOPERS") | csv_ids("LAVA_PRODUCT_DEVELOPERS")),
         ("express", csv_ids("LAVA_OFFER_EXPRESS") | csv_ids("LAVA_PRODUCT_EXPRESS")),
     )
@@ -163,6 +172,10 @@ def resolve_plan(payload: dict[str, Any], data: dict[str, Any]) -> str | None:
         if product_id and product_id.lower() in ids:
             return plan
 
+    if any(token in product_name for token in ("профи", "бизнес")):
+        return "business"
+    if "выбор" in product_name and "застройщик" in product_name:
+        return "choice"
     if any(token in product_name for token in ("застройщик", "developer")):
         return "developers"
     if any(token in product_name for token in ("полный", "full", "pro", "deep")):
@@ -272,6 +285,80 @@ def record_sqlite(event: dict[str, Any], status: str, payload: dict[str, Any]) -
         conn.close()
 
 
+CREDIT_STATEMENTS = (
+    """
+    CREATE TABLE IF NOT EXISTS audit_credits (
+        id TEXT PRIMARY KEY,
+        email TEXT NOT NULL,
+        payment_event_id TEXT UNIQUE,
+        contract_id TEXT,
+        plan TEXT NOT NULL,
+        granted INTEGER NOT NULL,
+        remaining INTEGER NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS audit_credits_email_idx ON audit_credits (email)",
+)
+
+
+def ensure_credit_tables(cur) -> None:
+    for statement in CREDIT_STATEMENTS:
+        cur.execute(statement)
+
+
+def grant_project_slots(cur, event: dict[str, Any]) -> None:
+    slots = PLAN_SLOTS.get(event.get("plan") or "")
+    email = (event.get("email") or "").strip().lower()
+    event_id = event.get("event_id")
+    if not slots or not email or not event_id:
+        return
+    ensure_credit_tables(cur)
+    cur.execute(
+        """
+        INSERT INTO audit_credits (
+            id, email, payment_event_id, contract_id, plan, granted, remaining
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (payment_event_id) DO NOTHING
+        """,
+        (
+            str(uuid.uuid4()),
+            email,
+            event_id,
+            event.get("contract_id"),
+            event.get("plan"),
+            slots,
+            slots,
+        ),
+    )
+
+
+def revoke_project_slots(cur, event: dict[str, Any]) -> None:
+    email = (event.get("email") or "").strip().lower()
+    if not email:
+        return
+    ensure_credit_tables(cur)
+    contract_id = event.get("contract_id")
+    if contract_id:
+        cur.execute(
+            "UPDATE audit_credits SET remaining = 0 WHERE email = %s AND contract_id = %s",
+            (email, contract_id),
+        )
+        return
+    cur.execute(
+        """
+        UPDATE audit_credits SET remaining = 0
+        WHERE id = (
+            SELECT id FROM audit_credits
+            WHERE email = %s AND remaining > 0
+            ORDER BY created_at DESC
+            LIMIT 1
+        )
+        """,
+        (email,),
+    )
+
+
 def mark_project_paid(cur, event: dict[str, Any], status: str) -> None:
     """Не роняет вебхук, если таблицы projects в Supabase ещё нет."""
     paid = status == "paid" and event["plan"] in PAID_PLANS
@@ -350,6 +437,10 @@ def record_postgres(event: dict[str, Any], status: str, payload: dict[str, Any])
                     ),
                 )
             mark_project_paid(cur, event, status)
+            if inserted and status == "paid":
+                grant_project_slots(cur, event)
+            elif status == "revoked":
+                revoke_project_slots(cur, event)
         conn.commit()
     return inserted
 
