@@ -61,6 +61,32 @@ def load_prompt_from_github(jurisdiction: str, audit_type: str = "express") -> s
         
     return "Проведи строительный экспресс-аудит проекта."
 
+
+BUSINESS_REPORT_ADDENDUM = (
+    "\n\n--- ТАРИФ «ПРОФИ / БИЗНЕС» (10 ПРОЕКТОВ) ---\n"
+    "К стандартной структуре отчёта добавь новый раздел. Вставь его после раздела "
+    "«📊 5. Инженерно-техническая таблица рисков» и до раздела «💡 6. Итоговое заключение инженера». "
+    "Нумерацию разделов 1–6 не меняй. Заголовок раздела пиши дословно:\n"
+    "### 🛠️ Рекомендации для строителей и проектировщиков\n"
+    "Внутри раздела сделай два подраздела и не оставляй их пустыми:\n"
+    "#### Для проектировщиков\n"
+    "- Что исправить в чертежах, расчётах, узлах, спецификациях и смете по замечаниям этого отчёта.\n"
+    "- Для каждого пункта укажи лист или узел, если он читается в файле, и норму, на которую опирается правка.\n"
+    "#### Для строителей\n"
+    "- Что проверить на площадке до закупки и до закрытия работ.\n"
+    "- Какие узлы контролировать и какой риск брака, удорожания или срыва сроков следует из найденных замечаний.\n"
+    "Пиши только по загруженным материалам. Не добавляй общие советы, которых нет в файле. "
+    "Не выдумывай марки, объёмы и пункты норм: если данных нет, так и напиши в этом пункте. "
+    "Этот раздел не заменяет разделы 2–6.\n"
+)
+
+
+def report_prompt(base_prompt: str, tier: str) -> str:
+    if (tier or "").strip().lower() == "business":
+        return base_prompt + BUSINESS_REPORT_ADDENDUM
+    return base_prompt
+
+
 # 1. ЭНДПОИНТ ЭКСПРЕСС-АУДИТА (Flash)
 @app.post("/api/audit/express")
 async def run_express_audit(
@@ -111,9 +137,11 @@ async def run_deep_audit(
     email: str = Form(...), 
     file: UploadFile = File(...),
     jurisdiction: str = Form(default="russia"),
-    payment_verified: str = Form(default="true")
+    payment_verified: str = Form(default="true"),
+    tier: str = Form(default="full"),
 ):
-    active_prompt = load_prompt_from_github(jurisdiction, audit_type="deep")
+    paid_tier = (tier or "").strip().lower()
+    active_prompt = report_prompt(load_prompt_from_github(jurisdiction, audit_type="deep"), paid_tier)
 
     file_bytes = await file.read()
     file_base64 = base64.b64encode(file_bytes).decode("utf-8")
@@ -145,7 +173,7 @@ async def run_deep_audit(
 
     return {
         "status": "success", 
-        "tier": "deep", 
+        "tier": "business" if paid_tier == "business" else "deep", 
         "jurisdiction": jurisdiction, 
         "report": report_text,
         "pdf_url": "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf"
