@@ -1,8 +1,7 @@
 """API аудита СтройАудит.ai: экспресс- и глубокий аудит, вебхуки Lava.top.
 
 Оплата глубокого аудита проверяется на сервере: сайт выдаёт одноразовый
-подписанный тикет, API погашает его и сам списывает кредит. Пока
-AUDIT_TICKET_SECRET не задан, работает легаси-режим (payment_verified).
+подписанный тикет, API погашает его и сам списывает кредит.
 """
 
 import base64
@@ -21,7 +20,6 @@ from audit_flow import (
     consume_credit,
     consume_ticket_once,
     restore_credit,
-    ticket_secret,
     validate_upload,
     verify_ticket,
 )
@@ -232,12 +230,9 @@ async def run_express_audit(
 @app.post("/api/audit/deep")
 async def run_deep_audit(
     request: Request,
-    email: str = Form(...), 
     file: UploadFile = File(...),
     jurisdiction: str = Form(default="russia"),
-    ticket: str = Form(default=""),
-    payment_verified: str = Form(default="true"),
-    tier: str = Form(default="full"),
+    ticket: str = Form(...),
 ):
     limited = rate_limited(DEEP_LIMITER, request)
     if limited:
@@ -246,39 +241,22 @@ async def run_deep_audit(
     if problem:
         raise HTTPException(status_code=400, detail=problem)
 
-    secret = ticket_secret()
-    claim = None
-    if secret:
-        payload = verify_ticket(ticket)
-        if not payload:
-            raise HTTPException(
-                status_code=401,
-                detail="Ссылка на запуск недействительна. Обновите страницу и попробуйте ещё раз.",
-            )
-        if not consume_ticket_once(payload["jti"]):
-            raise HTTPException(status_code=409, detail="Этот запуск уже использован.")
-        audit_email = payload["email"]
-        audit_tier = payload["plan"]
-        claim = consume_credit(audit_email, audit_tier)
-        if not claim:
-            raise HTTPException(
-                status_code=402,
-                detail="На этой почте не осталось оплаченных проектов.",
-            )
-    else:
-        if ticket:
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "code": "ticket_not_configured",
-                    "detail": "Сервис обновляется. Повторите запуск отчёта через пару минут.",
-                },
-            )
-        if str(payment_verified).lower() not in ("true", "1", "yes", "on"):
-            raise HTTPException(status_code=402, detail="Оплата не подтверждена.")
-        log.warning("Легаси-запуск аудита без тикета: задайте AUDIT_TICKET_SECRET")
-        audit_email = (email or "").strip().lower()
-        audit_tier = (tier or "").strip().lower()
+    payload = verify_ticket(ticket)
+    if not payload:
+        raise HTTPException(
+            status_code=401,
+            detail="Ссылка на запуск недействительна. Обновите страницу и попробуйте ещё раз.",
+        )
+    if not consume_ticket_once(payload["jti"]):
+        raise HTTPException(status_code=409, detail="Этот запуск уже использован.")
+    audit_email = payload["email"]
+    audit_tier = payload["plan"]
+    claim = consume_credit(audit_email, audit_tier)
+    if not claim:
+        raise HTTPException(
+            status_code=402,
+            detail="На этой почте не осталось оплаченных проектов.",
+        )
 
     active_prompt = report_prompt(load_prompt_from_github(jurisdiction, audit_type="deep"), audit_tier)
     file_data_url = await read_file_data_url(file)
@@ -286,8 +264,7 @@ async def run_deep_audit(
         report_text = run_openrouter(active_prompt, file_data_url, DEEP_MODEL)
     except Exception:
         log.exception("Глубокий аудит не удался")
-        if claim:
-            restore_credit(claim["claim_id"])
+        restore_credit(claim["claim_id"])
         return JSONResponse(
             status_code=502,
             content={"detail": "Не удалось проанализировать проект. Оплаченный проект возвращён на баланс — попробуйте позже."},
@@ -296,7 +273,7 @@ async def run_deep_audit(
     return {
         "status": "success", 
         "tier": "business" if audit_tier == "business" else "deep", 
-        "plan": claim["plan"] if claim else (audit_tier or "full"),
+        "plan": claim["plan"],
         "jurisdiction": jurisdiction, 
         "report": report_text,
     }
