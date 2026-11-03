@@ -1,32 +1,84 @@
+"""API аудита СтройАудит.ai: экспресс- и глубокий аудит, вебхуки Lava.top.
+
+Оплата глубокого аудита проверяется на сервере: сайт выдаёт одноразовый
+подписанный тикет, API погашает его и сам списывает кредит. Пока
+AUDIT_TICKET_SECRET не задан, работает легаси-режим (payment_verified).
+"""
+
 import base64
+import logging
 import os
+
 import requests
-from datetime import datetime
 from functools import lru_cache
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException
+
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from audit_flow import (
+    SlidingWindowLimiter,
+    consume_credit,
+    consume_ticket_once,
+    restore_credit,
+    ticket_secret,
+    validate_upload,
+    verify_ticket,
+)
 from payments import router as payments_router
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("stroy-audit-api")
 
 app = FastAPI()
 
+# Прямые запросы из браузера идут только с наших доменов.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=[
+        "https://stroyaudit-ai.com",
+        "https://stroy-audit-web.vercel.app",
+        "http://localhost:3000",
+    ],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
 app.include_router(payments_router)
 
+
 @app.get("/")
 def health_check():
     return {"status": "online", "service": "stroy-audit-api"}
 
+
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-GOOGLE_SHEET_URL = "https://script.google.com/macros/s/AKfycbzBeIqxEy3j38ZjsEvg31NRdPW36qZ4trttabPISAo-uVYDdAZvAcEZrr8eypMycmEiwQ/exec"
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+EXPRESS_MODEL = "google/gemini-2.5-flash"
+DEEP_MODEL = "google/gemini-2.5-pro"
+
+EXPRESS_LIMITER = SlidingWindowLimiter(limit=5, window_seconds=600)
+DEEP_LIMITER = SlidingWindowLimiter(limit=4, window_seconds=600)
+
+
+def client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    if request.client:
+        return request.client.host
+    return "unknown"
+
+
+def rate_limited(limiter: SlidingWindowLimiter, request: Request) -> JSONResponse | None:
+    if limiter.allow(client_ip(request)):
+        return None
+    return JSONResponse(
+        status_code=429,
+        content={"detail": "Слишком много запросов. Подождите пару минут и попробуйте снова."},
+    )
+
 
 @lru_cache(maxsize=16)
 def load_prompt_from_github(jurisdiction: str, audit_type: str = "express") -> str:
@@ -109,44 +161,67 @@ def report_prompt(base_prompt: str, tier: str) -> str:
     return prompt
 
 
-# 1. ЭНДПОИНТ ЭКСПРЕСС-АУДИТА (Flash)
-@app.post("/api/audit/express")
-async def run_express_audit(
-    email: str = Form(...), 
-    file: UploadFile = File(...),
-    consent_accepted: str = Form(...),
-    jurisdiction: str = Form(default="russia")
-):
-    if not str(consent_accepted).lower() in ("true", "1", "yes", "on"):
-        raise HTTPException(status_code=400, detail="Необходимо согласие с дисклеймером.")
+MAX_FILE_BYTES = 50 * 1024 * 1024
 
-    active_prompt = load_prompt_from_github(jurisdiction, audit_type="express")
 
-    file_bytes = await file.read()
+async def read_file_data_url(file: UploadFile) -> str:
+    file_bytes = await file.read(MAX_FILE_BYTES + 1)
+    if len(file_bytes) > MAX_FILE_BYTES:
+        raise HTTPException(status_code=400, detail="Файл больше 50 МБ. Разделите проект на части.")
     file_base64 = base64.b64encode(file_bytes).decode("utf-8")
     mime_type = file.content_type or "application/pdf"
-    file_data_url = f"data:{mime_type};base64,{file_base64}"
+    return f"data:{mime_type};base64,{file_base64}"
 
+
+def run_openrouter(prompt: str, file_data_url: str, model: str) -> str:
     ai_payload = {
-        "model": "google/gemini-2.5-flash",
+        "model": model,
         "messages": [{
             "role": "user",
             "content": [
-                {"type": "text", "text": active_prompt},
+                {"type": "text", "text": prompt},
                 {"type": "image_url", "image_url": {"url": file_data_url}},
             ],
         }],
     }
 
+    response = requests.post(
+        OPENROUTER_URL,
+        json=ai_payload,
+        headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
+        timeout=180,
+    )
+    response.raise_for_status()
+    ai_data = response.json()
+    report_text = ai_data["choices"][0]["message"].get("content") if "choices" in ai_data else None
+    if not report_text:
+        raise ValueError("OpenRouter не вернул текст отчёта.")
+    return report_text
+
+
+# 1. ЭНДПОИНТ ЭКСПРЕСС-АУДИТА (Flash)
+@app.post("/api/audit/express")
+async def run_express_audit(
+    request: Request,
+    email: str = Form(...), 
+    file: UploadFile = File(...),
+    consent_accepted: str = Form(...),
+    jurisdiction: str = Form(default="russia")
+):
+    limited = rate_limited(EXPRESS_LIMITER, request)
+    if limited:
+        return limited
+    if not str(consent_accepted).lower() in ("true", "1", "yes", "on"):
+        raise HTTPException(status_code=400, detail="Необходимо согласие с дисклеймером.")
+
+    problem = validate_upload(file)
+    if problem:
+        raise HTTPException(status_code=400, detail=problem)
+
+    active_prompt = load_prompt_from_github(jurisdiction, audit_type="express")
+    file_data_url = await read_file_data_url(file)
     try:
-        response = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            json=ai_payload,
-            headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
-            timeout=180,
-        )
-        ai_data = response.json()
-        report_text = ai_data["choices"][0]["message"].get("content") if "choices" in ai_data else "Ошибка анализа."
+        report_text = run_openrouter(active_prompt, file_data_url, EXPRESS_MODEL)
     except Exception as e:
         report_text = f"Ошибка экспресс-анализа: {e}"
 
@@ -156,47 +231,72 @@ async def run_express_audit(
 # 2. ЭНДПОИНТ ГЛУБОКОГО АУДИТА (Pro + PDF ссылка)
 @app.post("/api/audit/deep")
 async def run_deep_audit(
+    request: Request,
     email: str = Form(...), 
     file: UploadFile = File(...),
     jurisdiction: str = Form(default="russia"),
+    ticket: str = Form(default=""),
     payment_verified: str = Form(default="true"),
     tier: str = Form(default="full"),
 ):
-    paid_tier = (tier or "").strip().lower()
-    active_prompt = report_prompt(load_prompt_from_github(jurisdiction, audit_type="deep"), paid_tier)
+    limited = rate_limited(DEEP_LIMITER, request)
+    if limited:
+        return limited
+    problem = validate_upload(file)
+    if problem:
+        raise HTTPException(status_code=400, detail=problem)
 
-    file_bytes = await file.read()
-    file_base64 = base64.b64encode(file_bytes).decode("utf-8")
-    mime_type = file.content_type or "application/pdf"
-    file_data_url = f"data:{mime_type};base64,{file_base64}"
+    secret = ticket_secret()
+    claim = None
+    if secret:
+        payload = verify_ticket(ticket)
+        if not payload:
+            raise HTTPException(
+                status_code=401,
+                detail="Ссылка на запуск недействительна. Обновите страницу и попробуйте ещё раз.",
+            )
+        if not consume_ticket_once(payload["jti"]):
+            raise HTTPException(status_code=409, detail="Этот запуск уже использован.")
+        audit_email = payload["email"]
+        audit_tier = payload["plan"]
+        claim = consume_credit(audit_email, audit_tier)
+        if not claim:
+            raise HTTPException(
+                status_code=402,
+                detail="На этой почте не осталось оплаченных проектов.",
+            )
+    else:
+        if ticket:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "code": "ticket_not_configured",
+                    "detail": "Сервис обновляется. Повторите запуск отчёта через пару минут.",
+                },
+            )
+        if str(payment_verified).lower() not in ("true", "1", "yes", "on"):
+            raise HTTPException(status_code=402, detail="Оплата не подтверждена.")
+        log.warning("Легаси-запуск аудита без тикета: задайте AUDIT_TICKET_SECRET")
+        audit_email = (email or "").strip().lower()
+        audit_tier = (tier or "").strip().lower()
 
-    ai_payload = {
-        "model": "google/gemini-2.5-pro",
-        "messages": [{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": active_prompt},
-                {"type": "image_url", "image_url": {"url": file_data_url}},
-            ],
-        }],
-    }
-
+    active_prompt = report_prompt(load_prompt_from_github(jurisdiction, audit_type="deep"), audit_tier)
+    file_data_url = await read_file_data_url(file)
     try:
-        response = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            json=ai_payload,
-            headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
-            timeout=180,
+        report_text = run_openrouter(active_prompt, file_data_url, DEEP_MODEL)
+    except Exception:
+        log.exception("Глубокий аудит не удался")
+        if claim:
+            restore_credit(claim["claim_id"])
+        return JSONResponse(
+            status_code=502,
+            content={"detail": "Не удалось проанализировать проект. Оплаченный проект возвращён на баланс — попробуйте позже."},
         )
-        ai_data = response.json()
-        report_text = ai_data["choices"][0]["message"].get("content") if "choices" in ai_data else "Ошибка глубокого анализа."
-    except Exception as e:
-        report_text = f"Ошибка глубокого анализа: {e}"
 
     return {
         "status": "success", 
-        "tier": "business" if paid_tier == "business" else "deep", 
+        "tier": "business" if audit_tier == "business" else "deep", 
+        "plan": claim["plan"] if claim else (audit_tier or "full"),
         "jurisdiction": jurisdiction, 
         "report": report_text,
-        "pdf_url": "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf"
     }
