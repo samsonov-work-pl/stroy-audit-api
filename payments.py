@@ -15,20 +15,16 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 
-import subscriptions as subscription_store
-
 log = logging.getLogger("lava-webhook")
 
 SUCCESS_EVENTS = {
     "payment.success",
-    "subscription.recurring.payment.success",
 }
 REVOKE_EVENTS = {
     "refund.success",
     "chargeback.initiated",
-    "subscription.cancelled",
 }
-PAID_PLANS = ("full", "choice", "business", "developers")
+PAID_PLANS = ("full", "choice", "business")
 PLAN_SLOTS = {"full": 1, "choice": 3, "business": 10}
 KNOWN_FULL_PRODUCTS = {"e262a88a-aabe-4a5b-8cf8-d0774e25f98a"}
 KNOWN_FULL_OFFERS = {"897a9501-3853-49cd-b22c-1cada7b220ba"}
@@ -42,7 +38,6 @@ PLAN_LABELS = {
     "full": "Полный аудит",
     "choice": "Выбор застройщика",
     "business": "Профи / Бизнес",
-    "developers": "Для застройщиков",
 }
 
 router = APIRouter()
@@ -163,7 +158,6 @@ def resolve_plan(payload: dict[str, Any], data: dict[str, Any]) -> str | None:
         ("full", csv_ids("LAVA_OFFER_FULL") | csv_ids("LAVA_PRODUCT_FULL") | KNOWN_FULL_PRODUCTS | KNOWN_FULL_OFFERS),
         ("choice", csv_ids("LAVA_OFFER_CHOICE") | csv_ids("LAVA_PRODUCT_CHOICE") | KNOWN_CHOICE_PRODUCTS | KNOWN_CHOICE_OFFERS),
         ("business", csv_ids("LAVA_OFFER_BUSINESS") | csv_ids("LAVA_PRODUCT_BUSINESS") | KNOWN_BUSINESS_PRODUCTS | KNOWN_BUSINESS_OFFERS),
-        ("developers", csv_ids("LAVA_OFFER_DEVELOPERS") | csv_ids("LAVA_PRODUCT_DEVELOPERS")),
         ("express", csv_ids("LAVA_OFFER_EXPRESS") | csv_ids("LAVA_PRODUCT_EXPRESS")),
     )
     for plan, ids in mapping:
@@ -176,8 +170,6 @@ def resolve_plan(payload: dict[str, Any], data: dict[str, Any]) -> str | None:
         return "business"
     if "выбор" in product_name and "застройщик" in product_name:
         return "choice"
-    if any(token in product_name for token in ("застройщик", "developer")):
-        return "developers"
     if any(token in product_name for token in ("полный", "full", "pro", "deep")):
         return "full"
     if "экспресс" in product_name or "express" in product_name:
@@ -464,7 +456,7 @@ async def lava_webhook(request: Request) -> dict[str, Any]:
         status = "paid"
     elif event_type in REVOKE_EVENTS:
         status = "revoked"
-    elif event_type in {"payment.failed", "subscription.recurring.payment.failed"}:
+    elif event_type == "payment.failed":
         status = "failed"
     else:
         log.info("Пропущено событие Lava: %s", event_type or "unknown")
@@ -476,9 +468,6 @@ async def lava_webhook(request: Request) -> dict[str, Any]:
     sqlite_new = record_sqlite(event, status, payload)
     pg_new = record_postgres(event, status, payload)
     created = sqlite_new and pg_new
-    subscription_store.apply(event, status, payload)
-    if created and event["plan"] == "developers" and event_type == "payment.success":
-        subscription_store.send_welcome(event, payload)
 
     log.info(
         "Lava %s plan=%s email=%s contract=%s duplicate=%s",
@@ -498,27 +487,3 @@ async def lava_webhook(request: Request) -> dict[str, Any]:
         "contract_id": event["contract_id"],
     }
 
-
-@router.post("/api/subscriptions/cancel")
-async def cancel_subscription(request: Request) -> dict[str, Any]:
-    """Отмена поддержкой: тот же X-Api-Key, что у вебхука Lava.top. Аккаунт не нужен."""
-    raw_body = await request.body()
-    authenticate(request, raw_body)
-    try:
-        payload = json.loads(raw_body.decode("utf-8") or "{}")
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        raise HTTPException(status_code=400, detail="Некорректный JSON.") from None
-    if not isinstance(payload, dict):
-        raise HTTPException(status_code=400, detail="Ожидался объект JSON.")
-    email = as_text(payload.get("email"))
-    subscription_id = as_text(payload.get("subscription_id"))
-    if email:
-        email = email.lower()
-    if not email and not subscription_id:
-        raise HTTPException(status_code=400, detail="Нужен email или subscription_id.")
-    try:
-        updated = subscription_store.cancel_by_support(email, subscription_id)
-    except RuntimeError as error:
-        raise HTTPException(status_code=503, detail=str(error)) from error
-    log.info("Поддержка отменила подписку email=%s id=%s rows=%s", email, subscription_id, updated)
-    return {"ok": True, "updated": updated, "status": "cancelled"}
