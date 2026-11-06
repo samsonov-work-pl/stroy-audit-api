@@ -214,6 +214,59 @@ def parse_event(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def enrich_event_from_invoices(event: dict[str, Any]) -> dict[str, Any]:
+    """Инвойсы, созданные нашим API, записываются в lava_invoices вместе с
+    email и тарифом. Если вебхук пришёл без email или тарифа (или Lava
+    сменит формат payload), достаём их оттуда по id инвойса."""
+    if (event.get("email") and event.get("plan")) or not event.get("contract_id"):
+        return event
+    dsn = (os.getenv("DATABASE_URL") or "").strip()
+    if not dsn:
+        return event
+    try:
+        import psycopg
+    except ImportError:
+        return event
+    try:
+        with psycopg.connect(dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS lava_invoices (
+                        invoice_id TEXT PRIMARY KEY,
+                        email TEXT NOT NULL,
+                        plan TEXT NOT NULL,
+                        amount NUMERIC NOT NULL,
+                        currency TEXT NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                cur.execute(
+                    "SELECT email, plan FROM lava_invoices WHERE invoice_id = %s",
+                    (event["contract_id"],),
+                )
+                row = cur.fetchone()
+            conn.commit()
+    except Exception:
+        log.exception("Не удалось сверить вебхук с lava_invoices")
+        return event
+    if not row:
+        return event
+    stored_email, stored_plan = row
+    if not event.get("email") and stored_email:
+        event["email"] = str(stored_email).strip().lower()
+    if not event.get("plan") and stored_plan:
+        event["plan"] = str(stored_plan).strip().lower()
+    log.info(
+        "Вебхук дополнен из lava_invoices: invoice=%s email=%s plan=%s",
+        event["contract_id"],
+        event["email"],
+        event["plan"],
+    )
+    return event
+
+
 def sqlite_conn() -> sqlite3.Connection:
     path = Path(os.getenv("PAYMENTS_DB_PATH") or "payments.db")
     conn = sqlite3.connect(path)
@@ -449,7 +502,7 @@ async def lava_webhook(request: Request) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Ожидался объект JSON.")
 
-    event = parse_event(payload)
+    event = enrich_event_from_invoices(parse_event(payload))
     event_type = event["event_type"]
 
     if event_type in SUCCESS_EVENTS:
@@ -486,4 +539,3 @@ async def lava_webhook(request: Request) -> dict[str, Any]:
         "email": event["email"],
         "contract_id": event["contract_id"],
     }
-

@@ -24,6 +24,7 @@ from audit_flow import (
     verify_ticket,
 )
 from payments import router as payments_router
+from invoices import router as invoices_router
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("stroy-audit-api")
@@ -44,6 +45,7 @@ app.add_middleware(
 )
 
 app.include_router(payments_router)
+app.include_router(invoices_router)
 
 
 @app.get("/")
