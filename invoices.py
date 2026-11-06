@@ -30,7 +30,10 @@ PRODUCTS_URL = "https://gate.lava.top/api/v1/products"
 
 # Сумма задаётся на сервере: клиент не может повлиять на цену.
 PLAN_PRICES = {"full": 990, "choice": 1990, "business": 4990}
-CURRENCY = "RUB"
+# Для тестовых оплат сумму и валюту можно переопределить переменными окружения
+# LAVA_PRICE_FULL / LAVA_PRICE_CHOICE / LAVA_PRICE_BUSINESS и LAVA_CURRENCY,
+# не трогая код. После теста переменные удалить — вернутся базовые цены в рублях.
+CURRENCY = (os.getenv("LAVA_CURRENCY") or "RUB").strip().upper()
 
 # offerId продуктов кабинета. Продукт должен быть опубликован с признаком
 # «Цена по запросу API». Env-переменные перекрывают значения по умолчанию.
@@ -79,6 +82,21 @@ def offer_for(plan: str) -> str | None:
     return from_env or OFFER_FALLBACK.get(plan)
 
 
+def plan_amount(plan: str) -> int | float:
+    """Базовая цена тарифа; env LAVA_PRICE_<PLAN> перекрывает (для тестов)."""
+    env_name = f"LAVA_PRICE_{plan.upper()}"
+    raw = (os.getenv(env_name) or "").strip()
+    if raw:
+        try:
+            value = float(raw)
+            if value > 0:
+                return int(value) if value.is_integer() else value
+            log.warning("%s=%r неположительна, использую базовую цену", env_name, raw)
+        except ValueError:
+            log.warning("%s=%r не число, использую базовую цену", env_name, raw)
+    return PLAN_PRICES[plan]
+
+
 def client_ip(request: Request) -> str:
     forwarded = request.headers.get("x-forwarded-for", "")
     if forwarded:
@@ -100,7 +118,7 @@ def pick_field(data: Any, *keys: str) -> str | None:
     return None
 
 
-def record_invoice_intent(invoice_id: str, email: str, plan: str, amount: int) -> None:
+def record_invoice_intent(invoice_id: str, email: str, plan: str, amount: int | float) -> None:
     """Запоминает намерение оплаты: вебхук возьмёт отсюда email и тариф,
     если его payload окажется без них (страховка от смены формата Lava)."""
     dsn = (os.getenv("DATABASE_URL") or "").strip()
@@ -153,12 +171,13 @@ async def create_lava_invoice(request: Request):
     offer = offer_for(plan)
     if not offer:
         raise HTTPException(status_code=500, detail=f"Не настроен offerId для тарифа {plan} ({OFFER_ENV[plan]}).")
+    amount = plan_amount(plan)
 
     payload = {
         "email": email,
         "offerId": offer,
         "currency": CURRENCY,
-        "amount": PLAN_PRICES[plan],
+        "amount": amount,
         "successful_return_url": f"{SITE_URL}/?payment=success&tier={plan}",
         "failure_return_url": f"{SITE_URL}/?payment=failed",
         "cancel_return_url": f"{SITE_URL}/?payment=cancelled",
@@ -201,13 +220,14 @@ async def create_lava_invoice(request: Request):
         log.error("Lava не вернула ссылку на оплату: %s", str(data)[:500])
         raise HTTPException(status_code=502, detail="Lava.top не вернул ссылку на оплату.")
 
-    record_invoice_intent(invoice_id or str(uuid.uuid4()), email, plan, PLAN_PRICES[plan])
+    record_invoice_intent(invoice_id or str(uuid.uuid4()), email, plan, amount)
 
     log.info(
-        "Lava invoice created plan=%s email=%s amount=%s invoice=%s",
+        "Lava invoice created plan=%s email=%s amount=%s currency=%s invoice=%s",
         plan,
         email,
-        PLAN_PRICES[plan],
+        amount,
+        CURRENCY,
         invoice_id,
     )
     return {
@@ -215,7 +235,7 @@ async def create_lava_invoice(request: Request):
         "invoiceId": invoice_id,
         "paymentUrl": payment_url,
         "plan": plan,
-        "amount": PLAN_PRICES[plan],
+        "amount": amount,
         "currency": CURRENCY,
     }
 
