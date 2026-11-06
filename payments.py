@@ -359,6 +359,21 @@ def grant_project_slots(cur, event: dict[str, Any]) -> None:
     if not slots or not email or not event_id:
         return
     ensure_credit_tables(cur)
+    # Одна и та же оплата может прийти двумя путями: вебхуком (event_id из
+    # payload Lava) и проверкой счёта через /api/invoice/lava/verify
+    # (event_id "invoice:<id>"). payment_event_id у них разный, поэтому
+    # дедуплицируем по contract_id (id инвойса Lava) до вставки.
+    if event.get("contract_id"):
+        cur.execute(
+            "SELECT 1 FROM audit_credits WHERE contract_id = %s LIMIT 1",
+            (event["contract_id"],),
+        )
+        if cur.fetchone():
+            log.info(
+                "Кредит по contract_id=%s уже начислен, повторное начисление пропущено",
+                event["contract_id"],
+            )
+            return
     cur.execute(
         """
         INSERT INTO audit_credits (

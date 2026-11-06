@@ -6,6 +6,10 @@ Invoice). Виджет и прямые ссылки платформы вебх�
 покупателя, ценой тарифа и адресом возврата, покупатель платит на странице
 Lava.top и возвращается на ?payment=success, а вебхук payment.success
 начисляет кредиты в Postgres.
+
+POST /api/invoice/lava/verify — страховка от потерянного вебхука: после
+возврата покупателя сервер сам спрашивает Lava о счёте
+(GET /api/v1/invoices/{id}) и, если счёт оплачен, начисляет кредиты.
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from audit_flow import SlidingWindowLimiter
+from payments import ensure_credit_tables, record_postgres, record_sqlite
 
 log = logging.getLogger("lava-invoices")
 
@@ -238,6 +243,170 @@ async def create_lava_invoice(request: Request):
         "amount": amount,
         "currency": CURRENCY,
     }
+
+
+INVOICE_STATUS_URL = "https://gate.lava.top/api/v1/invoices/{invoice_id}"
+# Статусы оплаченного счёта в ответе GET /api/v1/invoices/{id}. Lava в разных
+# местах дока пишет по-разному, поэтому принимаем все известные варианты.
+PAID_INVOICE_STATUSES = {"success", "paid", "succeeded", "completed"}
+
+
+def is_uuid(value: str) -> bool:
+    try:
+        uuid.UUID(value)
+        return True
+    except (ValueError, TypeError, AttributeError):
+        return False
+
+
+def find_status_value(value: Any, depth: int = 0) -> str | None:
+    """Ищет статус счёта в ответе Lava: формат ответа нестабилен, поэтому
+    проходим по вложенным объектам и берём первый похожий ключ."""
+    if depth > 3 or not isinstance(value, dict):
+        return None
+    for key in ("status", "state", "invoice_status", "invoiceStatus"):
+        candidate = value.get(key)
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    for child in value.values():
+        found = find_status_value(child, depth + 1)
+        if found:
+            return found
+    return None
+
+
+def stored_invoice(invoice_id: str) -> dict[str, Any] | None:
+    """Email и тариф из lava_invoices: счёт создан нашим сервером, поэтому
+    там есть всё, чего может не быть в ответе Lava."""
+    dsn = (os.getenv("DATABASE_URL") or "").strip()
+    if not dsn:
+        return None
+    try:
+        import psycopg
+    except ImportError:
+        log.warning("psycopg не установлен: данные счёта %s недоступны", invoice_id)
+        return None
+    try:
+        with psycopg.connect(dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute(LAVA_INVOICES_TABLE)
+                cur.execute(
+                    "SELECT email, plan, amount, currency FROM lava_invoices WHERE invoice_id = %s",
+                    (invoice_id,),
+                )
+                row = cur.fetchone()
+            conn.commit()
+    except Exception:
+        log.exception("Не удалось прочитать lava_invoices для счёта %s", invoice_id)
+        return None
+    if not row:
+        return None
+    return {
+        "email": str(row[0]).strip().lower(),
+        "plan": str(row[1]).strip().lower(),
+        "amount": row[2],
+        "currency": str(row[3]).strip().upper(),
+    }
+
+
+@router.post("/api/invoice/lava/verify")
+async def verify_lava_invoice(request: Request):
+    """Возврат покупателя с Lava: сверяем счёт напрямую в Lava API и, если он
+    оплачен, начисляем кредиты. Страховка от потерянного/несуществующего
+    вебхука: источник истины — GET /api/v1/invoices/{id}, а не запрос клиента.
+    Начисление идемпотентно: event_id "invoice:<id>" + contract_id счёта."""
+    if not INVOICE_LIMITER.allow(client_ip(request)):
+        return JSONResponse(
+            status_code=429,
+            content={"ok": False, "reason": "rate_limited", "detail": "Слишком много запросов. Подождите пару минут."},
+        )
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    invoice_id = ""
+    if isinstance(body, dict):
+        raw = body.get("invoiceId") or body.get("invoice_id")
+        if isinstance(raw, str):
+            invoice_id = raw.strip()
+    if not invoice_id or not is_uuid(invoice_id):
+        return {"ok": False, "reason": "bad_invoice_id"}
+
+    try:
+        response = requests.get(
+            INVOICE_STATUS_URL.format(invoice_id=invoice_id),
+            headers={"Accept": "application/json", "X-Api-Key": lava_api_key()},
+            timeout=20,
+        )
+    except requests.RequestException:
+        log.exception("Lava не отвечает на запрос счёта %s", invoice_id)
+        return {"ok": False, "reason": "lava_unavailable"}
+    if response.status_code == 404:
+        return {"ok": False, "reason": "invoice_not_found"}
+    if response.status_code >= 400:
+        log.error("Lava вернула %s на запрос счёта %s: %s", response.status_code, invoice_id, response.text[:300])
+        return {"ok": False, "reason": "lava_error", "lava_status": response.status_code}
+    try:
+        data = response.json()
+    except ValueError:
+        log.error("Lava вернула не-JSON по счёту %s: %s", invoice_id, response.text[:300])
+        return {"ok": False, "reason": "lava_bad_response"}
+
+    status = (find_status_value(data) or "").lower()
+    if status not in PAID_INVOICE_STATUSES:
+        log.info("Счёт %s ещё не оплачен: status=%r", invoice_id, status or None)
+        return {"ok": False, "reason": "not_paid", "status": status or None}
+
+    stored = stored_invoice(invoice_id)
+    if not stored:
+        # Счёт не создан нашим сервером (или БД недоступна): email и тариф
+        # взять неоткуда, кредить нельзя.
+        log.warning("Оплачен неизвестный счёт %s — нет записи в lava_invoices", invoice_id)
+        return {"ok": False, "reason": "unknown_invoice"}
+
+    dsn = (os.getenv("DATABASE_URL") or "").strip()
+    if dsn:
+        try:
+            import psycopg
+            with psycopg.connect(dsn) as conn:
+                with conn.cursor() as cur:
+                    ensure_credit_tables(cur)
+                    cur.execute(
+                        "SELECT 1 FROM audit_credits WHERE contract_id = %s LIMIT 1",
+                        (invoice_id,),
+                    )
+                    if cur.fetchone():
+                        log.info("Кредит по счёту %s уже начислен", invoice_id)
+                        return {"ok": True, "duplicate": True, "email": stored["email"], "plan": stored["plan"]}
+                conn.commit()
+        except Exception:
+            # Не блокируем начисление: grant_project_slots сам проверит contract_id.
+            log.exception("Не удалось проверить начисление по счёту %s", invoice_id)
+
+    event = {
+        "event_id": f"invoice:{invoice_id}",
+        "event_type": "payment.success",
+        "contract_id": invoice_id,
+        "email": stored["email"],
+        "plan": stored["plan"],
+        "amount": str(stored["amount"]),
+        "currency": stored["currency"],
+        "offer_id": None,
+        "product_id": None,
+        "product_name": None,
+    }
+    payload = {"invoice_id": invoice_id, "status": status, "source": "verify"}
+    record_sqlite(event, "paid", payload)
+    inserted = record_postgres(event, "paid", payload)
+    log.info(
+        "Verify счёта %s: email=%s plan=%s duplicate=%s",
+        invoice_id,
+        stored["email"],
+        stored["plan"],
+        not inserted,
+    )
+    return {"ok": True, "duplicate": not inserted, "email": stored["email"], "plan": stored["plan"]}
 
 
 @router.get("/api/invoice/lava/products")
