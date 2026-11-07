@@ -25,6 +25,7 @@ from audit_flow import (
 )
 from payments import router as payments_router
 from invoices import router as invoices_router
+from admin_grant import router as admin_grant_router
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("stroy-audit-api")
@@ -46,6 +47,7 @@ app.add_middleware(
 
 app.include_router(payments_router)
 app.include_router(invoices_router)
+app.include_router(admin_grant_router)
 
 
 @app.get("/")
