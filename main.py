@@ -70,8 +70,7 @@ def client_ip(request: Request) -> str:
         return forwarded.split(",")[0].strip()
     if request.client:
         return request.client.host
-    return
- "unknown"
+    return "unknown"
 
 
 def rate_limited(limiter: SlidingWindowLimiter, request: Request) -> JSONResponse | None:
@@ -105,8 +104,7 @@ def load_prompt_from_github(jurisdiction: str, audit_type: str = "express") -> s
                     "1. В раздел '🔴 2. Критически важное' помести самые опасные несоответствия (например, сейсмика, общие нормы).\n"
                     "2. В раздел '🟡 3. Спорные решения' (Важно) обязательно помести 1-2 замечания по материалам, конструкциям или узлам (например, фундамент, утеплитель, перекрытия).\n"
                     "3. В раздел '🔵 4. Нужно уточнить' (Рекомендации) помести замечания по неполноте данных и добавь фразу: 'Рекомендуется выполнить полный аудит с добавлением файлов по смежным разделам (Генеральный план, ОВиК, ВК, ЭОМ) при их наличии'.\n"
-                    "4. В конце добавь блок о том, что полная таблица рисков и официальный PDF-отчет доступны посл
-е разблокировки Pro-версии.\n"
+                    "4. В конце добавь блок о том, что полная таблица рисков и официальный PDF-отчет доступны после разблокировки Pro-версии.\n"
                 )
                 return base_prompt + express_modifier
                 
@@ -140,8 +138,7 @@ BUSINESS_REPORT_ADDENDUM = (
     "\n\n--- ТАРИФ «ПРОФИ / БИЗНЕС» (10 ПРОЕКТОВ) ---\n"
     "К стандартной структуре отчёта добавь новый раздел. Вставь его после раздела "
     "«⚖️ Сравнение рисков и переплат» и до раздела «💡 6. Выводы аудита». "
-    "Нумерацию раздел
-ов 1–6 не меняй. Заголовок раздела пиши дословно:\n"
+    "Нумерацию разделов 1–6 не меняй. Заголовок раздела пиши дословно:\n"
     "### 🛠️ Рекомендации для строителей и проектировщиков\n"
     "Внутри раздела сделай два подраздела и не оставляй их пустыми:\n"
     "#### Для проектировщиков\n"
@@ -206,7 +203,6 @@ def run_openrouter(prompt: str, file_data_url: str, model: str) -> str:
         }],
     }
 
-
     response = requests.post(
         OPENROUTER_URL,
         json=ai_payload,
@@ -241,8 +237,8 @@ async def run_express_audit(
         raise HTTPException(status_code=400, detail=problem)
 
     active_prompt = load_prompt_from_github(jurisdiction, audit_type="express")
-    active_prompt += f"\n\n--- ДАННЫЕ ЗАПУСКА ---\nИмя загруженного файла для строки «Файл:» в начале раздела 1: {file.filename or 'не указано'}.\nБольше никаких служебных данных этого запроса в отчет не выводи."
     file_data_url = await read_file_data_url(file)
+    active_prompt += f"\n\n--- ДАННЫЕ ЗАПУСКА ---\nИмя загруженного файла для строки «Файл:» в начале раздела 1: {file.filename or 'не указано'}.\nБольше никаких служебных данных этого запроса в отчет не выводи."
     try:
         report_text = run_openrouter(active_prompt, file_data_url, EXPRESS_MODEL)
     except Exception as e:
@@ -266,8 +262,7 @@ async def run_deep_audit(
     if problem:
         raise HTTPException(status_code=400, detail=problem)
 
-    payload = veri
-fy_ticket(ticket)
+    payload = verify_ticket(ticket)
     if not payload:
         raise HTTPException(
             status_code=401,
@@ -285,8 +280,8 @@ fy_ticket(ticket)
         )
 
     active_prompt = report_prompt(load_prompt_from_github(jurisdiction, audit_type="deep"), audit_tier)
-    active_prompt += f"\n\n--- ДАННЫЕ ЗАПУСКА ---\nИмя загруженного файла для строки «Файл:» в начале раздела 1: {file.filename or 'не указано'}.\nБольше никаких служебных данных этого запроса в отчет не выводи."
     file_data_url = await read_file_data_url(file)
+    active_prompt += f"\n\n--- ДАННЫЕ ЗАПУСКА ---\nИмя загруженного файла для строки «Файл:» в начале раздела 1: {file.filename or 'не указано'}.\nБольше никаких служебных данных этого запроса в отчет не выводи."
     try:
         report_text = run_openrouter(active_prompt, file_data_url, DEEP_MODEL)
     except Exception:
