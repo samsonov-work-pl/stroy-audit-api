@@ -9,6 +9,7 @@ import logging
 import os
 
 import requests
+from datetime import datetime, timezone
 from functools import lru_cache
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -62,6 +63,9 @@ DEEP_MODEL = "google/gemini-2.5-pro"
 
 EXPRESS_LIMITER = SlidingWindowLimiter(limit=5, window_seconds=600)
 DEEP_LIMITER = SlidingWindowLimiter(limit=4, window_seconds=600)
+
+# Логирование согласий с дисклеймером в Google-таблицу (вебхук Apps Script).
+GOOGLE_SHEET_URL = "https://script.google.com/macros/s/AKfycbzBeIqxEy3j38ZjsEvg31NRdPW36qZ4trttabPISAo-uVYDdAZvAcEZrr8eypMycmEiwQ/exec"
 
 
 def client_ip(request: Request) -> str:
@@ -227,6 +231,7 @@ async def run_express_audit(
     email: str = Form(...), 
     file: UploadFile = File(...),
     consent_accepted: str = Form(...),
+    consent_version: str = Form(default=""),
     jurisdiction: str = Form(default="russia")
 ):
     limited = rate_limited(EXPRESS_LIMITER, request)
@@ -234,6 +239,23 @@ async def run_express_audit(
         return limited
     if not str(consent_accepted).lower() in ("true", "1", "yes", "on"):
         raise HTTPException(status_code=400, detail="Необходимо согласие с дисклеймером.")
+
+    # Записываем согласие в Google-таблицу; сбой лога не должен ломать аудит.
+    if GOOGLE_SHEET_URL:
+        try:
+            requests.post(
+                GOOGLE_SHEET_URL,
+                json={
+                    "email": email,
+                    "consent_accepted": True,
+                    "consent_version": consent_version,
+                    "jurisdiction": jurisdiction,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                },
+                timeout=3,
+            )
+        except Exception as sheet_error:
+            log.warning("Не удалось записать согласие в Google-таблицу: %s", sheet_error)
 
     problem = validate_upload(file)
     if problem:
