@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse
 
 from audit_flow import (
     SlidingWindowLimiter,
-    consume_credit,
+    consume_credits,
     consume_ticket_once,
     restore_credit,
     validate_upload,
@@ -63,6 +63,9 @@ DEEP_MODEL = "google/gemini-2.5-pro"
 
 EXPRESS_LIMITER = SlidingWindowLimiter(limit=5, window_seconds=600)
 DEEP_LIMITER = SlidingWindowLimiter(limit=4, window_seconds=600)
+
+# Сколько файлов одного проекта можно прикрепить к одному глубокому запуску.
+TIER_MAX_FILES = {"full": 1, "choice": 3, "business": 10}
 
 # Логирование согласий с дисклеймером в Google-таблицу (вебхук Apps Script).
 GOOGLE_SHEET_URL = "https://script.google.com/macros/s/AKfycbzBeIqxEy3j38ZjsEvg31NRdPW36qZ4trttabPISAo-uVYDdAZvAcEZrr8eypMycmEiwQ/exec"
@@ -187,6 +190,7 @@ def report_prompt(base_prompt: str, tier: str) -> str:
 
 
 MAX_FILE_BYTES = 50 * 1024 * 1024
+MAX_TOTAL_UPLOAD_BYTES = 60 * 1024 * 1024
 
 
 async def read_file_data_url(file: UploadFile) -> str:
@@ -198,15 +202,38 @@ async def read_file_data_url(file: UploadFile) -> str:
     return f"data:{mime_type};base64,{file_base64}"
 
 
-def run_openrouter(prompt: str, file_data_url: str, model: str) -> str:
+async def read_files_data_urls(files: list[UploadFile]) -> list[str]:
+    """Читает все файлы запуска в data-URL; проверяет лимит каждого файла и суммарный размер."""
+    data_urls: list[str] = []
+    total_bytes = 0
+    for upload in files:
+        file_bytes = await upload.read(MAX_FILE_BYTES + 1)
+        if len(file_bytes) > MAX_FILE_BYTES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Файл «{upload.filename or 'без имени'}» больше 50 МБ. Разделите проект на части.",
+            )
+        total_bytes += len(file_bytes)
+        if total_bytes > MAX_TOTAL_UPLOAD_BYTES:
+            raise HTTPException(
+                status_code=400,
+                detail="Суммарный размер файлов больше 60 МБ. Разделите запуск на несколько.",
+            )
+        file_base64 = base64.b64encode(file_bytes).decode("utf-8")
+        mime_type = upload.content_type or "application/pdf"
+        data_urls.append(f"data:{mime_type};base64,{file_base64}")
+    return data_urls
+
+
+def run_openrouter(prompt: str, file_data_urls: list[str], model: str) -> str:
+    content: list[dict] = [{"type": "text", "text": prompt}]
+    for file_data_url in file_data_urls:
+        content.append({"type": "image_url", "image_url": {"url": file_data_url}})
     ai_payload = {
         "model": model,
         "messages": [{
             "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": file_data_url}},
-            ],
+            "content": content,
         }],
     }
 
@@ -265,27 +292,31 @@ async def run_express_audit(
     file_data_url = await read_file_data_url(file)
     active_prompt += f"\n\n--- ДАННЫЕ ЗАПУСКА ---\nИмя загруженного файла для строки «Файл:» в начале раздела 1: {file.filename or 'не указано'}.\nБольше никаких служебных данных этого запроса в отчет не выводи."
     try:
-        report_text = run_openrouter(active_prompt, file_data_url, EXPRESS_MODEL)
+        report_text = run_openrouter(active_prompt, [file_data_url], EXPRESS_MODEL)
     except Exception as e:
         report_text = f"Ошибка экспресс-анализа: {e}"
 
     return {"status": "success", "tier": "express", "jurisdiction": jurisdiction, "report": report_text}
 
 
-# 2. ЭНДПОИНТ ГЛУБОКОГО АУДИТА (Pro + PDF ссылка)
+# 2. ЭНДПОИНТ ГЛУБОКОГО АУДИТА (Pro + PDF ссылка). Поддерживает несколько файлов одного проекта.
 @app.post("/api/audit/deep")
 async def run_deep_audit(
     request: Request,
-    file: UploadFile = File(...),
+    file: list[UploadFile] = File(...),
     jurisdiction: str = Form(default="russia"),
     ticket: str = Form(...),
 ):
     limited = rate_limited(DEEP_LIMITER, request)
     if limited:
         return limited
-    problem = validate_upload(file)
-    if problem:
-        raise HTTPException(status_code=400, detail=problem)
+    uploads = [item for item in file if item is not None]
+    if not uploads:
+        raise HTTPException(status_code=400, detail="Прикрепите хотя бы один файл проекта.")
+    for upload in uploads:
+        problem = validate_upload(upload)
+        if problem:
+            raise HTTPException(status_code=400, detail=problem)
 
     payload = verify_ticket(ticket)
     if not payload:
@@ -297,30 +328,56 @@ async def run_deep_audit(
         raise HTTPException(status_code=409, detail="Этот запуск уже использован.")
     audit_email = payload["email"]
     audit_tier = payload["plan"]
-    claim = consume_credit(audit_email, audit_tier)
-    if not claim:
+    max_files = TIER_MAX_FILES.get(audit_tier, 1)
+    if len(uploads) > max_files:
         raise HTTPException(
-            status_code=402,
-            detail="На этой почте не осталось оплаченных проектов.",
+            status_code=400,
+            detail=f"Для этого тарифа можно прикрепить не более {max_files} файл(ов) за один запуск.",
         )
 
+    # Читаем файлы до списания кредитов: проблема размера не должна стоить проектов.
+    file_data_urls = await read_files_data_urls(uploads)
+    file_count = len(file_data_urls)
+
+    claims = consume_credits(audit_email, audit_tier, file_count)
+    if not claims:
+        raise HTTPException(
+            status_code=402,
+            detail=(
+                f"Для запуска с {file_count} файл(ами) нужно {file_count} оплаченных проект(ов). "
+                "На этой почте их не хватает."
+            ),
+        )
+
+    file_names = [upload.filename or "не указано" for upload in uploads]
+    if len(file_names) == 1:
+        files_line = f"Имя загруженного файла для строки «Файл:» в начале раздела 1: {file_names[0]}."
+    else:
+        files_line = (
+            f"Файлов в запуске: {len(file_names)} — это разделы одного проекта. "
+            f"Имена загруженных файлов для строки «Файл:» в начале раздела 1 (перечисли все): "
+            + "; ".join(file_names)
+            + "."
+        )
     active_prompt = report_prompt(load_prompt_from_github(jurisdiction, audit_type="deep"), audit_tier)
-    file_data_url = await read_file_data_url(file)
-    active_prompt += f"\n\n--- ДАННЫЕ ЗАПУСКА ---\nИмя загруженного файла для строки «Файл:» в начале раздела 1: {file.filename or 'не указано'}.\nБольше никаких служебных данных этого запроса в отчет не выводи."
+    active_prompt += f"\n\n--- ДАННЫЕ ЗАПУСКА ---\n{files_line}\nБольше никаких служебных данных этого запроса в отчет не выводи."
     try:
-        report_text = run_openrouter(active_prompt, file_data_url, DEEP_MODEL)
+        report_text = run_openrouter(active_prompt, file_data_urls, DEEP_MODEL)
     except Exception:
         log.exception("Глубокий аудит не удался")
-        restore_credit(claim["claim_id"])
+        for claim in claims:
+            restore_credit(claim["claim_id"])
         return JSONResponse(
             status_code=502,
-            content={"detail": "Не удалось проанализировать проект. Оплаченный проект возвращён на баланс — попробуйте позже."},
+            content={"detail": "Не удалось проанализировать проект. Оплаченные проекты возвращены на баланс — попробуйте позже."},
         )
 
     return {
         "status": "success", 
         "tier": "business" if audit_tier == "business" else "deep", 
-        "plan": claim["plan"],
+        "plan": claims[0]["plan"],
         "jurisdiction": jurisdiction, 
         "report": report_text,
+        "files": file_names,
+        "credits_spent": file_count,
     }

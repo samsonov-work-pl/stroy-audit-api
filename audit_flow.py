@@ -177,6 +177,90 @@ def consume_credit(email: str, preferred_plan: str | None = None) -> dict[str, A
     return {"claim_id": claim_id, "plan": plan}
 
 
+def credits_available(email: str) -> int:
+    """Суммарный остаток оплаченных проектов на почте (по всем тарифам)."""
+    dsn = database_url()
+    if not dsn:
+        log.error("DATABASE_URL не задан: остаток недоступен")
+        return 0
+    try:
+        import psycopg
+    except ImportError:
+        log.error("psycopg не установлен: остаток недоступен")
+        return 0
+    try:
+        with psycopg.connect(dsn) as conn:
+            with conn.cursor() as cur:
+                ensure_flow_tables(cur)
+                cur.execute(
+                    "SELECT COALESCE(SUM(remaining), 0) FROM audit_credits WHERE email = %s",
+                    (email,),
+                )
+                row = cur.fetchone()
+            conn.commit()
+        return int(row[0]) if row else 0
+    except Exception:
+        log.exception("Не удалось посчитать остаток кредитов")
+        return 0
+
+
+def consume_credits(email: str, preferred_plan: str | None, count: int) -> list[dict[str, Any]] | None:
+    """Списывает count оплаченных проектов одним одобрением транзакции.
+
+    Слот = файл: запуск с N файлами списывает N кредитов (минимум 1).
+    Предпочтение отдаётся кредитам тарифа preferred_plan. Возвращает список
+    списаний [{"claim_id", "plan"}] или None, если на почте не хватает слотов.
+    """
+    if count < 1:
+        return None
+    dsn = database_url()
+    if not dsn:
+        log.error("DATABASE_URL не задан: списание невозможно")
+        return None
+    try:
+        import psycopg
+    except ImportError:
+        log.error("psycopg не установлен: списание невозможно")
+        return None
+    claims: list[dict[str, Any]] = []
+    with psycopg.connect(dsn) as conn:
+        with conn.cursor() as cur:
+            ensure_flow_tables(cur)
+            cur.execute(
+                """
+                SELECT id, plan, remaining FROM audit_credits
+                WHERE email = %s AND remaining > 0
+                ORDER BY CASE WHEN plan = %s THEN 0 ELSE 1 END, created_at
+                FOR UPDATE
+                """,
+                (email, (preferred_plan or "").strip().lower()),
+            )
+            rows = cur.fetchall()
+            if sum(row[2] for row in rows) < count:
+                return None
+            left_to_take = count
+            for credit_id, plan, remaining in rows:
+                take = min(remaining, left_to_take)
+                if take <= 0:
+                    break
+                cur.execute(
+                    "UPDATE audit_credits SET remaining = remaining - %s WHERE id = %s",
+                    (take, credit_id),
+                )
+                for _ in range(take):
+                    claim_id = str(uuid.uuid4())
+                    cur.execute(
+                        "INSERT INTO audit_credit_uses (id, email, credit_id) VALUES (%s, %s, %s)",
+                        (claim_id, email, credit_id),
+                    )
+                    claims.append({"claim_id": claim_id, "plan": plan})
+                left_to_take -= take
+            if left_to_take > 0:
+                return None
+        conn.commit()
+    return claims
+
+
 def restore_credit(claim_id: str) -> bool:
     """Возвращает списанный проект на баланс (например, при сбое анализа)."""
     dsn = database_url()
