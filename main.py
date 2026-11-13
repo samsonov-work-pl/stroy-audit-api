@@ -12,6 +12,8 @@ import requests
 from datetime import datetime, timezone
 from functools import lru_cache
 
+from report_filter import scrub_report
+
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -297,6 +299,7 @@ async def run_express_audit(
     except Exception as e:
         report_text = f"Ошибка экспресс-анализа: {e}"
 
+    report_text = scrub_report(report_text)
     return {"status": "success", "tier": "express", "jurisdiction": jurisdiction, "report": report_text}
 
 
@@ -373,6 +376,7 @@ async def run_deep_audit(
             content={"detail": "Не удалось проанализировать проект. Оплаченные проекты возвращены на баланс — попробуйте позже."},
         )
 
+    report_text = scrub_report(report_text)
     return {
         "status": "success", 
         "tier": "business" if audit_tier == "business" else "deep", 
